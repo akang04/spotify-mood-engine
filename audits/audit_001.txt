@@ -1,0 +1,172 @@
+SPOTIFY MOOD ENGINE — PROJECT AUDIT
+Generated: 2026-06-12
+====================================================
+
+BRANCH
+------
+feature/genre-clustering
+(Only one commit: ffcb596 "Initial commit" — all work is uncommitted local state)
+
+
+====================================================
+FILE CONTENTS SUMMARY
+====================================================
+
+--- app/models.py ---
+  - User: id, spotify_id, display_name, email, access_token, refresh_token,
+          token_expires_at, created_at; relationships to Track, ListeningHistory, Cluster
+  - Track: user_id FK, spotify_track_id, name, artist, album, duration_ms,
+           popularity, genres (String), added_at; relationships to AudioFeatures,
+           ListeningHistory, User
+  - AudioFeatures: track_id FK, valence, energy, danceability, tempo, acousticness,
+                   instrumentalness, speechiness, loudness, liveness, key, mode,
+                   time_signature — POPULATED NOWHERE (dead schema weight)
+  - ListeningHistory: user_id FK, track_id FK, played_at (indexed); unique on
+                      (user_id, track_id, played_at)
+  - Cluster: user_id FK, cluster_index, label, centroid_valence…centroid_speechiness,
+             created_at — centroid audio columns are NEVER WRITTEN (dead weight)
+
+--- app/database.py ---
+  - SQLite at data/mood_engine.db
+  - init_db() creates tables + runs idempotent ALTER TABLE migration to add genres column
+  - get_session() returns a plain SessionLocal()
+
+--- app/auth.py ---
+  - SpotifyOAuth manager built from SPOTIPY_CLIENT_ID / _CLIENT_SECRET / _REDIRECT_URI env vars
+  - Scopes: user-library-read, user-top-read, user-read-recently-played,
+            playlist-modify-public/private, user-read-private, user-read-email
+  - get_spotify_client(): reads cached token, refreshes if expired
+  - get_auth_url(), exchange_code(), get_current_user() helpers
+
+--- app/fetch.py ---
+  - Module-level _artist_genre_cache dict for process-lifetime artist→genres memoization
+  - upsert_user(): fetches Spotify profile; email stored as profile.get("email") or ""
+  - _upsert_track(): inserts Track, then fills genres via sp.artist() on first encounter
+  - fetch_saved_tracks(): pages all Liked Songs via sp.next()
+  - fetch_top_tracks(): all three time ranges (short/medium/long_term), limit=50 each
+  - fetch_recently_played(): up to 50 recent plays; ListeningHistory upserted via
+                             sqlite_insert().on_conflict_do_nothing()
+  - sync_all(): upsert_user → fetch_saved_tracks → fetch_top_tracks → fetch_recently_played
+  - load_tracks_dataframe(): simple Track query; returns track_id, spotify_track_id, name,
+                             artist, album, popularity (0 if None), genres ("" if None)
+  - load_history_dataframe(): LEFT JOIN ListeningHistory×Track; adds hour column
+
+--- app/cluster.py ---
+  - GENRE_TOP_N=50, K_MIN=2, K_MAX=10
+  - _GENRE_MOOD_RULES: 34 ordered (genre-substring → mood-label) rules; specific
+                       multi-word rules precede component words (e.g. "indie pop" before "pop")
+  - build_feature_matrix(): top-N genre one-hot + NORMALIZED POPULARITY column →
+                            StandardScaler → returns (X_scaled, scaler, feature_names)
+  - select_k(): silhouette scoring across K_MIN…K_MAX; returns best K
+  - run_kmeans(): fits KMeans with n_init="auto"
+  - assign_clusters(): adds "cluster" int column to df copy
+  - infer_mood_label(): first-match substring scan of top-genre list against rules
+  - save_clusters(): deletes existing rows, inserts new Cluster rows with label only
+                     (centroid audio columns left NULL)
+  - load_cluster_labels(): returns {cluster_index: label} dict
+  - infer_current_mood(): ±2-hour window of listening history → mode cluster
+  - pca_projection(): 2D PCA for scatter visualisation
+  - genre_distribution(): top-N genres per cluster by track count
+
+--- app/recommend.py ---
+  - get_library_tracks_for_cluster(): sorts cluster tracks by popularity DESC, returns
+                                      spotify_track_ids up to limit=30
+  - get_catalog_recommendations(): sp.recommendations(seed_tracks=seeds[:5], limit=limit);
+                                   catches ANY exception and returns [] with a warning log
+  - build_playlist(): library tracks first; if expand_catalog=True and under target_size,
+                      fills remainder from catalog; deduplicates; caps at target_size
+  - create_or_replace_playlist(): searches user's existing playlists for "Mood Engine: {label}";
+                                  creates if absent; replaces all tracks in 100-item batches
+
+--- app/ui.py ---
+  - _handle_oauth(): reads ?code= query param, calls exchange_code(), clears params
+  - _try_load_client(): loads cached Spotipy client into st.session_state.sp
+  - _load_app_state(): queries DB for User by spotify_id; loads tracks DF + cluster labels
+  - render_login(): title + link_button to Spotify OAuth URL
+  - render_sidebar(): Sync Library + Re-cluster buttons; Current Mood metric
+  - render_charts(): PCA scatter (Plotly) + genre bar chart per cluster
+  - render_playlist_section(): mood selector (deduplicates same-label clusters), track count
+                               input, catalog expansion checkbox, "Create Playlist" button
+  - main(): set_page_config → init_db → handle OAuth → load client → render all sections
+
+--- main.py ---
+  from app.ui import main
+  main()
+
+--- requirements.txt ---
+  spotipy>=2.23.0, streamlit>=1.35.0, sqlalchemy>=2.0.0, scikit-learn>=1.4.0,
+  pandas>=2.1.0, plotly>=5.20.0, numpy>=1.26.0, python-dotenv>=1.0.0
+
+
+====================================================
+FEBRUARY 2026 DEPRECATION FIXES — STATUS
+====================================================
+
+Fix 1: popularity removed from feature matrix
+  STATUS: NOT APPLIED
+  cluster.py lines 92–95:
+    popularity = (df["popularity"].fillna(0).values.astype(float) / 100.0).reshape(-1, 1)
+    X = np.hstack([genre_matrix, popularity]) if top_genres else popularity
+    feature_names = top_genres + ["popularity"]
+  Popularity is still appended as a feature column and included in feature_names.
+  It also shows up in save_clusters() genre_names filtering (line 161: f != "popularity"),
+  and recommend.py:get_library_tracks_for_cluster() still sorts by popularity DESC.
+  The column exists in the DB schema and is written on every track upsert — not a crash,
+  but the feature fix is not done.
+
+Fix 2: catalog expansion removed
+  STATUS: NOT APPLIED (graceful fallback present, but feature not removed)
+  recommend.py:build_playlist() still has expand_catalog: bool = True parameter.
+  get_catalog_recommendations() still calls sp.recommendations(); catches Exception
+  and returns [] with a warning — so a 403 won't crash the app, but the catalog
+  expansion code path remains. ui.py still renders the "Catalog expansion" checkbox.
+  The intent was to remove the feature outright; instead it was made fault-tolerant.
+  Whether that's acceptable depends on intent.
+
+Fix 3: email field handled gracefully
+  STATUS: APPLIED
+  fetch.py:upsert_user() line 49:
+    user.email = profile.get("email") or ""
+  This safely handles None (profiles without a public email) by writing an empty
+  string rather than None. No crash risk.
+
+
+====================================================
+APP RUN STATUS
+====================================================
+
+Static analysis (no live run performed):
+
+LIKELY CLEAN:
+  - All inter-module imports resolve correctly (verified by tracing all import paths)
+  - No circular imports
+  - SQLAlchemy 2.x DeclarativeBase usage is correct
+  - st.query_params API (dict-style) matches Streamlit >=1.30 — requirements say >=1.35
+  - sqlite_insert().on_conflict_do_nothing() is correct SQLAlchemy SQLite dialect usage
+  - n_init="auto" is valid for scikit-learn >=1.2 — requirements say >=1.4
+  - PCA(random_state=42) is valid sklearn API
+
+KNOWN DEAD WEIGHT (won't crash, but wastes schema space):
+  - AudioFeatures table: defined in models, never written to
+  - Cluster centroid_valence/energy/danceability/tempo/acousticness/instrumentalness/
+    speechiness columns: defined, never written to (save_clusters leaves them NULL)
+
+POTENTIAL RUNTIME ISSUES (not crashes at import; will surface on live use):
+  - Missing .env → KeyError on os.environ["SPOTIPY_CLIENT_ID"] at first Spotipy call
+    (acceptable — app fails fast with a clear error)
+  - First full sync: ~1 sp.artist() call per unique primary artist; 500-track library
+    ≈ 500 extra API calls (slow but correct; cached for session lifetime)
+  - sp.recommendations() may return 403 under Extended Quota policy — handled gracefully
+  - venv package install state not verified (requirements.txt present; install not confirmed)
+
+EDGE CASE IN recommend.py:get_library_tracks_for_cluster():
+  - Sorts by "popularity" column which can be 0 (fallback from load_tracks_dataframe).
+    Not a bug, but all unsynced tracks sort equally at 0.
+
+SUMMARY: App should start and render the login page without errors assuming the venv
+is fully installed. OAuth + sync flow is untested against the live Spotify API on this branch.
+
+
+====================================================
+END OF AUDIT
+====================================================
