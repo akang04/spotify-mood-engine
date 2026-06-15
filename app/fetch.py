@@ -34,19 +34,42 @@ def _parse_iso(ts: Optional[str]) -> Optional[datetime]:
     return datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None)
 
 
-def _get_artist_genres(sp: spotipy.Spotify, artist_id: str) -> str:
-    """Return comma-joined genre string for artist_id, using the process-level cache."""
-    if artist_id in _artist_genre_cache:
-        return _artist_genre_cache[artist_id]
-    time.sleep(0.1)
-    try:
-        data = sp.artist(artist_id)
-        genres_str = ", ".join(data.get("genres", []))
-    except Exception as exc:
-        logger.warning("Could not fetch genres for artist %s: %s", artist_id, exc)
-        genres_str = ""
-    _artist_genre_cache[artist_id] = genres_str
-    return genres_str
+def _enrich_genres_batch(
+    sp: spotipy.Spotify,
+    session: Session,
+    artist_map: dict[str, list[int]],
+) -> None:
+    """
+    Batch-fetch genres for all artists in artist_map and update their tracks.
+
+    artist_map: {spotify_artist_id -> [track.id, ...]}
+    Uses sp.artists() (max 50 IDs per call) instead of one sp.artist() call per
+    artist, reducing N calls to ceil(N/50) calls.
+    """
+    unknown = [aid for aid in artist_map if aid not in _artist_genre_cache]
+    for i in range(0, len(unknown), 50):
+        batch = unknown[i : i + 50]
+        time.sleep(0.1)
+        try:
+            result = sp.artists(batch)
+            for artist_data in result.get("artists") or []:
+                if artist_data:
+                    _artist_genre_cache[artist_data["id"]] = ", ".join(
+                        artist_data.get("genres", [])
+                    )
+        except Exception as exc:
+            logger.warning("Batch artist genres failed (batch %d): %s", i // 50, exc)
+    # Mark any artist the API didn't return so we don't retry on next sync
+    for aid in unknown:
+        _artist_genre_cache.setdefault(aid, "")
+
+    for artist_id, track_ids in artist_map.items():
+        genres_str = _artist_genre_cache.get(artist_id, "")
+        for track_id in track_ids:
+            track = session.get(Track, track_id)
+            if track is not None and track.genres is None:
+                track.genres = genres_str
+    session.commit()
 
 
 def load_lastfm_api_key() -> str:
@@ -182,13 +205,13 @@ def _upsert_track(
     session: Session,
     user_id: int,
     item: dict,
-    sp: spotipy.Spotify,
     added_at: Optional[str] = None,
-) -> Track:
+) -> tuple[Track, Optional[str]]:
     """
     Persist a track from a Spotify API item dict.
     Handles both bare track objects and wrapper dicts with a "track" key.
-    Fetches primary-artist genres via sp.artist() on first encounter (cached).
+    Returns (track, primary_artist_id) where primary_artist_id is set only when
+    genres are still missing — caller must pass it to _enrich_genres_batch.
     """
     track_data: dict = item.get("track") or item
     spotify_id: str = track_data["id"]
@@ -216,19 +239,21 @@ def _upsert_track(
     if track.genres is None:
         artists = track_data.get("artists", [])
         primary_artist_id = artists[0].get("id") if artists else None
-        if primary_artist_id:
-            track.genres = _get_artist_genres(sp, primary_artist_id)
+        return track, primary_artist_id
 
-    return track
+    return track, None
 
 
 def fetch_saved_tracks(sp: spotipy.Spotify, session: Session, user: User) -> int:
     """Page through the user's Liked Songs and persist all tracks."""
     count = 0
+    artist_map: dict[str, list[int]] = {}
     results = sp.current_user_saved_tracks(limit=50)
     while results:
         for item in results["items"]:
-            _upsert_track(session, user.id, item, sp, added_at=item.get("added_at"))
+            track, artist_id = _upsert_track(session, user.id, item, added_at=item.get("added_at"))
+            if artist_id:
+                artist_map.setdefault(artist_id, []).append(track.id)
             count += 1
         session.commit()
         if results.get("next"):
@@ -236,6 +261,7 @@ def fetch_saved_tracks(sp: spotipy.Spotify, session: Session, user: User) -> int
             results = sp.next(results)
         else:
             results = None
+    _enrich_genres_batch(sp, session, artist_map)
     logger.info("Saved tracks synced: %d", count)
     return count
 
@@ -243,11 +269,14 @@ def fetch_saved_tracks(sp: spotipy.Spotify, session: Session, user: User) -> int
 def fetch_top_tracks(sp: spotipy.Spotify, session: Session, user: User) -> int:
     """Fetch top tracks across all three Spotify time ranges and persist them."""
     count = 0
+    artist_map: dict[str, list[int]] = {}
     for time_range in ("short_term", "medium_term", "long_term"):
         results = sp.current_user_top_tracks(limit=50, time_range=time_range)
         while results:
             for item in results["items"]:
-                _upsert_track(session, user.id, {"track": item}, sp)
+                track, artist_id = _upsert_track(session, user.id, {"track": item})
+                if artist_id:
+                    artist_map.setdefault(artist_id, []).append(track.id)
                 count += 1
             session.commit()
             if results.get("next"):
@@ -255,6 +284,7 @@ def fetch_top_tracks(sp: spotipy.Spotify, session: Session, user: User) -> int:
                 results = sp.next(results)
             else:
                 results = None
+    _enrich_genres_batch(sp, session, artist_map)
     logger.info("Top tracks synced: %d", count)
     return count
 
@@ -263,8 +293,11 @@ def fetch_recently_played(sp: spotipy.Spotify, session: Session, user: User) -> 
     """Fetch up to 50 recent plays (Spotify API limit) with timestamps."""
     results = sp.current_user_recently_played(limit=50)
     count = 0
+    artist_map: dict[str, list[int]] = {}
     for item in results.get("items", []):
-        track = _upsert_track(session, user.id, item, sp)
+        track, artist_id = _upsert_track(session, user.id, item)
+        if artist_id:
+            artist_map.setdefault(artist_id, []).append(track.id)
         played_at = _parse_iso(item.get("played_at"))
         if played_at:
             stmt = (
@@ -275,19 +308,9 @@ def fetch_recently_played(sp: spotipy.Spotify, session: Session, user: User) -> 
             session.execute(stmt)
             count += 1
     session.commit()
+    _enrich_genres_batch(sp, session, artist_map)
     logger.info("Recent plays synced: %d", count)
     return count
-
-
-def sync_all(sp: spotipy.Spotify, session: Session, api_key: Optional[str] = None) -> User:
-    """Full sync: upsert user, fetch all track sources, optionally enrich with Last.fm tags."""
-    user = upsert_user(session, sp)
-    fetch_saved_tracks(sp, session, user)
-    fetch_top_tracks(sp, session, user)
-    fetch_recently_played(sp, session, user)
-    if api_key:
-        fetch_lastfm_tags(session, user, api_key)
-    return user
 
 
 def load_tracks_dataframe(session: Session, user: User) -> pd.DataFrame:

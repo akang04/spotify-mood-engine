@@ -4,6 +4,7 @@ import logging
 from datetime import datetime
 
 import plotly.express as px
+import spotipy
 import streamlit as st
 
 from app.auth import exchange_code, get_auth_url, get_spotify_client
@@ -31,7 +32,7 @@ from app.recommend import build_playlist, create_or_replace_playlist
 
 logger = logging.getLogger(__name__)
 
-_SESSION_KEYS = ("sp", "user", "spotify_id", "df_clustered", "kmeans", "scaler", "cluster_labels")
+_SESSION_KEYS = ("sp", "user", "spotify_id", "df_clustered", "kmeans", "cluster_labels")
 
 
 def _init_session() -> None:
@@ -116,23 +117,35 @@ def render_sidebar(session) -> None:
 
         if st.button("Sync Library", use_container_width=True):
             progress = st.progress(0, text="Connecting to Spotify…")
-            user = upsert_user(session, sp)
-            progress.progress(15, text="Syncing liked songs…")
-            fetch_saved_tracks(sp, session, user)
-            progress.progress(40, text="Syncing top tracks…")
-            fetch_top_tracks(sp, session, user)
-            progress.progress(65, text="Syncing recent plays…")
-            fetch_recently_played(sp, session, user)
-            if lastfm_api_key:
-                progress.progress(80, text="Fetching Last.fm tags… (this may take a bit for large libraries)")
-                fetch_lastfm_tags(session, user, lastfm_api_key)
-            progress.progress(100, text="Done!")
-            st.session_state.user = user
-            df = load_tracks_dataframe(session, user)
-            st.session_state.df_clustered = df
-            st.session_state.cluster_labels = load_cluster_labels(session, user)
-            st.success(f"Synced {len(df)} tracks.")
-            st.rerun()
+            try:
+                user = upsert_user(session, sp)
+                progress.progress(15, text="Syncing liked songs…")
+                fetch_saved_tracks(sp, session, user)
+                progress.progress(40, text="Syncing top tracks…")
+                fetch_top_tracks(sp, session, user)
+                progress.progress(65, text="Syncing recent plays…")
+                fetch_recently_played(sp, session, user)
+                if lastfm_api_key:
+                    progress.progress(80, text="Fetching Last.fm tags… (this may take a bit for large libraries)")
+                    fetch_lastfm_tags(session, user, lastfm_api_key)
+                progress.progress(100, text="Done!")
+                st.session_state.user = user
+                df = load_tracks_dataframe(session, user)
+                st.session_state.df_clustered = df
+                st.session_state.cluster_labels = load_cluster_labels(session, user)
+                st.success(f"Synced {len(df)} tracks.")
+                st.rerun()
+            except spotipy.exceptions.SpotifyException as exc:
+                if exc.http_status == 429:
+                    st.error(
+                        "Spotify rate limit reached. Your app has been temporarily blocked "
+                        "by Spotify — wait ~24 hours before trying to sync again."
+                    )
+                else:
+                    st.error(f"Spotify error {exc.http_status}: {exc.msg}")
+            except Exception as exc:
+                logger.exception("Sync failed")
+                st.error(f"Sync failed: {exc}")
         st.caption("Sync fetches Spotify library + Last.fm mood tags")
 
         if st.button(
@@ -142,10 +155,9 @@ def render_sidebar(session) -> None:
             help="Run K-means to find mood clusters in your library.",
         ):
             with st.spinner("Clustering…"):
-                df_c, kmeans, scaler, _ = run_clustering(df, session, user)
+                df_c, kmeans, _scaler, _scores = run_clustering(df, session, user)
                 st.session_state.df_clustered = df_c
                 st.session_state.kmeans = kmeans
-                st.session_state.scaler = scaler
                 st.session_state.cluster_labels = load_cluster_labels(session, user)
             st.success(f"Found {len(st.session_state.cluster_labels)} mood clusters.")
             st.rerun()

@@ -40,7 +40,12 @@ def get_spotify_client() -> spotipy.Spotify:
     if manager.is_token_expired(token_info):
         token_info = manager.refresh_access_token(token_info["refresh_token"])
 
-    return spotipy.Spotify(auth=token_info["access_token"])
+    return spotipy.Spotify(
+        auth=token_info["access_token"],
+        retries=3,
+        status_forcelist={429, 500, 502, 503, 504},
+        backoff_factor=1,
+    )
 
 
 def get_auth_url() -> str:
