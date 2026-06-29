@@ -24,6 +24,7 @@ class User(Base):
 
     tracks = relationship("Track", back_populates="user", cascade="all, delete-orphan")
     listening_history = relationship("ListeningHistory", back_populates="user", cascade="all, delete-orphan")
+    scrobble_history = relationship("ScrobbleHistory", back_populates="user", cascade="all, delete-orphan")
     clusters = relationship("Cluster", back_populates="user", cascade="all, delete-orphan")
 
 
@@ -40,6 +41,7 @@ class Track(Base):
     popularity = Column(Integer)
     genres = Column(String)
     lastfm_tags = Column(String)
+    cluster_index = Column(Integer)
     added_at = Column(DateTime)
 
     __table_args__ = (UniqueConstraint("user_id", "spotify_track_id"),)
@@ -60,6 +62,22 @@ class ListeningHistory(Base):
 
     user = relationship("User", back_populates="listening_history")
     track = relationship("Track", back_populates="listening_history")
+
+
+class ScrobbleHistory(Base):
+    __tablename__ = "scrobble_history"
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    artist = Column(String, nullable=False)
+    track_name = Column(String, nullable=False)
+    played_at = Column(DateTime, nullable=False, index=True)
+    track_id = Column(Integer, ForeignKey("tracks.id"), nullable=True)
+
+    __table_args__ = (UniqueConstraint("user_id", "artist", "track_name", "played_at"),)
+
+    user = relationship("User", back_populates="scrobble_history")
+    track = relationship("Track")
 
 
 class Cluster(Base):

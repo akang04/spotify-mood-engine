@@ -11,7 +11,7 @@ from sklearn.metrics import silhouette_score
 from sklearn.preprocessing import StandardScaler
 from sqlalchemy.orm import Session
 
-from app.models import Cluster, User
+from app.models import Cluster, Track, User
 
 logger = logging.getLogger(__name__)
 
@@ -292,4 +292,9 @@ def run_clustering(
     kmeans = run_kmeans(X, best_k)
     df_clustered = assign_clusters(df, kmeans.labels_)
     save_clusters(session, user, kmeans, scaler, feature_names)
+    for _, row in df_clustered.iterrows():
+        session.query(Track).filter_by(id=int(row["track_id"])).update(
+            {"cluster_index": int(row["cluster"])}
+        )
+    session.commit()
     return df_clustered, kmeans, scaler, scores

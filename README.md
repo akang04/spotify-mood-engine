@@ -2,6 +2,8 @@
 
 Spotify Mood Engine is a personal portfolio project that analyzes your Spotify listening history, groups your tracks into mood-based clusters, and generates playlists that match how you feel right now. It connects to your Spotify account, enriches your library with crowd-sourced genre tags from Last.fm, runs K-means clustering over that tag vocabulary, infers your current mood from what you tend to listen to at this hour of the day, and writes the resulting playlist directly back to your Spotify account. It also had to adapt twice to Spotify API deprecations mid-build, which shaped several of the architectural decisions described below.
 
+![Daylist — hour × day mood grid derived from Last.fm scrobble history](assets/daylist.png)
+
 ## How It Works
 
 After you connect with Spotify via OAuth, the app syncs your library in three passes: it pages through all of your Liked Songs, fetches your top tracks across Spotify's short-, medium-, and long-term time ranges, and pulls the last 50 recently played tracks along with their timestamps. For every track it encounters, it fetches the artist's genre tags from Spotify in batches of up to 50 artists per API call, then optionally enriches each track with crowd-sourced tags from Last.fm using a three-tier fallback: track-level tags first, artist-level tags if those come back empty, and the existing Spotify genres as a final fallback. All of this is persisted to a local SQLite database so subsequent syncs only fetch what's new.
@@ -10,18 +12,22 @@ Once your library is synced, Re-cluster builds a one-hot feature matrix over the
 
 Mood inference runs every time the sidebar renders: it looks at your listening history within a ±2-hour window of the current hour, finds the most common cluster among those plays, and surfaces it as a "Current Mood" metric. When you click **Create Playlist on Spotify**, the app randomly shuffles the tracks belonging to the selected cluster, creates or replaces a playlist named `Mood Engine: <label>` in your Spotify account, and returns a direct link.
 
+The app can also import your full Last.fm scrobble history (up to 24 months) via the **Sync Scrobble History** button. Scrobbles are matched to library tracks by artist and title so they inherit the same Last.fm tags used for clustering. From this data, the **Daylist** feature computes a mood + genre descriptor for any hour of any day of the week. Rather than surfacing your all-time most-played tags, it uses a relative-lift approach: each tag's share in the target time window is divided by its global share across the full history, so the descriptor reflects what you distinctively listen to at that moment rather than what dominates your library overall. A configurable exponential decay weight (half-life in days) further emphasises recent listening over older history. The result is a 168-cell (7 days × 24 hours) grid of descriptors — for example, "ambient j-pop tuesday midday" or "techno saturday late night" — each backed by the contributing track list and fallback-level metadata.
+
 ## Features
 
 - OAuth login with Spotify — no passwords stored; tokens cached locally
 - Full library sync: Liked Songs (all pages), top tracks (three time ranges), recently played
 - Batch artist genre enrichment via Spotify's multi-artist endpoint
 - Last.fm tag enrichment with three-tier fallback and a non-semantic tag blocklist
-- Automatic mood cluster discovery using K-means with silhouette-optimized K selection
+- Automatic mood cluster discovery using K-means with silhouette-optimized K selection (auto-sweep 2–10, or manual override)
 - PCA scatter plot of your library coloured by mood cluster
 - Top-tags-per-cluster bar chart reflecting both Spotify genres and Last.fm tags
 - Time-of-day mood inference from your listening history
 - One-click playlist creation or replacement on your Spotify account
 - Incremental syncs — only fetches tags for tracks that haven't been enriched yet
+- Last.fm scrobble history import (up to 24 months, incremental) with exponential time-decay weighting
+- Personalized daylist: derives a mood + genre descriptor for every hour of the week from your scrobble patterns using relative-lift scoring
 
 ## Tech Stack
 
@@ -113,17 +119,18 @@ The browser will open at `http://localhost:8501`. Click **Connect with Spotify**
 
 ```
 spotify-mood-engine/
-├── main.py                  # Entry point — calls app.ui.main()
+├── main.py                  # Entry point — configures logging, calls app.ui.main()
 ├── requirements.txt         # Pinned package versions
 ├── .env                     # API keys (not committed)
 │
 ├── app/
 │   ├── auth.py              # Spotify OAuth: token management, URL generation, code exchange
-│   ├── fetch.py             # Library sync, batch genre enrichment, Last.fm tag enrichment
+│   ├── fetch.py             # Library sync, batch genre enrichment, Last.fm tag/scrobble enrichment
 │   ├── cluster.py           # Feature matrix, K selection, K-means, mood labelling, PCA
+│   ├── daylist.py           # Temporal listening analysis: relative-lift scoring, 7×24 hour grid
 │   ├── recommend.py         # Playlist assembly and Spotify playlist push
 │   ├── database.py          # SQLAlchemy engine, session factory, schema migrations
-│   ├── models.py            # SQLAlchemy models: User, Track, ListeningHistory, Cluster
+│   ├── models.py            # SQLAlchemy models: User, Track, ListeningHistory, ScrobbleHistory, Cluster
 │   └── ui.py                # Streamlit page layout, OAuth callback handling, chart rendering
 │
 ├── tests/

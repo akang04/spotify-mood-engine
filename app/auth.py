@@ -30,20 +30,15 @@ def get_oauth_manager() -> SpotifyOAuth:
 
 
 def get_spotify_client() -> spotipy.Spotify:
-    """Return an authenticated Spotipy client, refreshing the token if needed."""
+    """Return an authenticated Spotipy client with auto token refresh."""
     manager = get_oauth_manager()
-    token_info = manager.get_cached_token()
-
-    if not token_info:
+    if not manager.get_cached_token():
         raise RuntimeError("No cached token found. Complete the OAuth flow first.")
 
-    if manager.is_token_expired(token_info):
-        token_info = manager.refresh_access_token(token_info["refresh_token"])
-
     return spotipy.Spotify(
-        auth=token_info["access_token"],
+        auth_manager=manager,
         retries=3,
-        status_forcelist={429, 500, 502, 503, 504},
+        status_forcelist={500, 502, 503, 504},  # 429 handled manually; auto-retry would block for hours
         backoff_factor=1,
     )
 

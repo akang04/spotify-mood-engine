@@ -18,6 +18,7 @@ def init_db() -> None:
         for ddl in [
             "ALTER TABLE tracks ADD COLUMN genres TEXT",
             "ALTER TABLE tracks ADD COLUMN lastfm_tags TEXT",
+            "ALTER TABLE tracks ADD COLUMN cluster_index INTEGER",
         ]:
             try:
                 conn.execute(text(ddl))
